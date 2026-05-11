@@ -1,0 +1,359 @@
+#!/bin/bash
+# Восстановление авторизации и плейлистов MediaCore
+INSTALL_DIR="/opt/mediacore"
+
+echo "Останавливаю сервис..."
+systemctl stop mediacore
+
+# Сохраняем текущий пароль админа (если он был изменён)
+OLD_PASS=$(grep 'ADMIN_PASS = ' "$INSTALL_DIR/app.py" | head -1 | awk -F'"' '{print $2}')
+if [ -z "$OLD_PASS" ]; then
+    OLD_PASS="admin"
+fi
+
+# Создаём абсолютно новый app.py со всеми функциями и логами
+cat > "$INSTALL_DIR/app.py" << 'APPEOF'
+#!/usr/bin/env python3
+"""
+MediaCore — видеохостинг для VRChat
+Модели данных:
+  videos: id, title, filename, original_url, duration, filesize, thumbnail, status, progress, created_at
+  view_log: id, video_id, ip, user_agent, viewed_at
+  playlists: id, name, videos (JSON), created_at
+  settings: key, value
+"""
+import os, json, subprocess, time, shutil
+from datetime import datetime
+from flask import Flask, request, jsonify, send_from_directory, session
+from werkzeug.utils import secure_filename
+import sqlite3
+
+app = Flask(__name__)
+# Постоянный секретный ключ (читаем из файла)
+key_file = "/opt/mediacore/secret_key"
+if not os.path.exists(key_file):
+    with open(key_file, "w") as f:
+        f.write(os.urandom(24).hex())
+with open(key_file) as f:
+    app.secret_key = f.read().strip()
+
+BASE = "/opt/mediacore"
+VIDEO = "/opt/video"
+THUMB = f"{BASE}/thumbnails"
+DB = f"{BASE}/data.db"
+ADMIN_PASS = "__PASSWORD__"
+
+# ---------- Логирование ----------
+def log_admin(action):
+    log_path = f"{BASE}/logs/admin.log"
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(log_path, "a") as f:
+        f.write(f"[{timestamp}] ADMIN: {action}\n")
+
+# ---------- База данных ----------
+def init_db():
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS videos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        filename TEXT,
+        original_url TEXT,
+        duration REAL,
+        filesize INTEGER,
+        thumbnail TEXT,
+        status TEXT DEFAULT 'processing',
+        progress INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS view_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        video_id INTEGER NOT NULL,
+        ip TEXT,
+        user_agent TEXT,
+        viewed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(video_id) REFERENCES videos(id)
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS playlists (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        videos TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )''')
+    defaults = {'hls_enabled': 'false', 'columns': '4', 'site_title': 'MediaCore'}
+    for k,v in defaults.items():
+        c.execute("INSERT OR IGNORE INTO settings (key,value) VALUES (?,?)", (k,v))
+    conn.commit()
+    conn.close()
+
+# ---------- Авторизация ----------
+@app.route('/api/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    if data.get('username') == 'admin' and data.get('password') == ADMIN_PASS:
+        session['admin'] = True
+        log_admin("Вход выполнен")
+        return jsonify(success=True)
+    log_admin("Неудачная попытка входа")
+    return jsonify(success=False), 401
+
+@app.route('/api/logout', methods=['POST'])
+def logout():
+    session.pop('admin', None)
+    return jsonify(success=True)
+
+def is_admin():
+    return session.get('admin', False)
+
+# ---------- Публичные API ----------
+@app.route('/api/videos')
+def list_videos():
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("SELECT id, title, duration, filesize, thumbnail FROM videos WHERE status='ready' ORDER BY created_at DESC")
+    rows = c.fetchall()
+    conn.close()
+    return jsonify([{
+        'id': r[0], 'title': r[1], 'duration': r[2], 'filesize': r[3],
+        'thumbnail': f'/static/thumbnails/{r[4]}' if r[4] else None
+    } for r in rows])
+
+@app.route('/api/videos/<int:vid>')
+def video_detail(vid):
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("SELECT id, title, filename, duration, filesize, thumbnail FROM videos WHERE id=?", (vid,))
+    r = c.fetchone()
+    conn.close()
+    if r:
+        return jsonify({
+            'id': r[0], 'title': r[1], 'url': f'/videos/{r[2]}',
+            'duration': r[3], 'filesize': r[4],
+            'thumbnail': f'/static/thumbnails/{r[5]}' if r[5] else None
+        })
+    return jsonify(error='Not found'), 404
+
+@app.route('/api/view/<int:vid>', methods=['POST'])
+def log_view(vid):
+    ip = request.remote_addr
+    ua = request.headers.get('User-Agent','')
+    conn = sqlite3.connect(DB)
+    conn.execute("INSERT INTO view_log (video_id, ip, user_agent) VALUES (?,?,?)", (vid, ip, ua))
+    conn.commit()
+    conn.close()
+    return jsonify(success=True)
+
+# ---------- Админские API ----------
+@app.route('/api/admin/stats')
+def stats():
+    if not is_admin(): return jsonify(error='Forbidden'), 403
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM videos WHERE status='ready'")
+    total_videos = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM view_log")
+    total_views = c.fetchone()[0]
+    conn.close()
+    return jsonify(total_videos=total_videos, total_views=total_views)
+
+@app.route('/api/admin/logs')
+def logs():
+    if not is_admin(): return jsonify(error='Forbidden'), 403
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("""
+        SELECT v.title, l.ip, l.user_agent, l.viewed_at
+        FROM view_log l LEFT JOIN videos v ON l.video_id = v.id
+        ORDER BY l.viewed_at DESC LIMIT 200
+    """)
+    rows = c.fetchall()
+    conn.close()
+    return jsonify([{'video': r[0], 'ip': r[1], 'ua': r[2], 'time': r[3]} for r in rows])
+
+@app.route('/api/admin/upload/file', methods=['POST'])
+def upload_file():
+    if not is_admin(): return jsonify(error='Forbidden'), 403
+    log_admin("Загрузка файла")
+    f = request.files.get('file')
+    if not f: return jsonify(error='No file'), 400
+    fname = secure_filename(f.filename)
+    save_path = os.path.join(VIDEO, fname)
+    f.save(save_path)
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("INSERT INTO videos (title, filename, status) VALUES (?,?,'processing')",
+              (os.path.splitext(fname)[0], fname))
+    vid = c.lastrowid
+    conn.commit()
+    conn.close()
+    subprocess.Popen([f"{BASE}/venv/bin/python3", f"{BASE}/utils.py", "convert", save_path, str(vid)])
+    return jsonify(success=True, video_id=vid)
+
+@app.route('/api/admin/upload/youtube', methods=['POST'])
+def upload_youtube():
+    if not is_admin(): return jsonify(error='Forbidden'), 403
+    log_admin("Загрузка с YouTube")
+    url = request.get_json().get('url')
+    if not url: return jsonify(error='No URL'), 400
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("INSERT INTO videos (title, original_url, status) VALUES ('YouTube видео',?,'processing')", (url,))
+    vid = c.lastrowid
+    conn.commit()
+    conn.close()
+    subprocess.Popen([f"{BASE}/venv/bin/python3", f"{BASE}/utils.py", "youtube", url, str(vid)])
+    return jsonify(success=True, video_id=vid)
+
+@app.route('/api/admin/delete/<int:vid>', methods=['DELETE'])
+def delete_video(vid):
+    if not is_admin(): return jsonify(error='Forbidden'), 403
+    log_admin(f"Удаление видео {vid}")
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("SELECT filename, thumbnail FROM videos WHERE id=?", (vid,))
+    row = c.fetchone()
+    if not row: return jsonify(error='Not found'), 404
+    fname, thumb = row
+    for path in [os.path.join(VIDEO, fname), os.path.join(THUMB, thumb)]:
+        if path and os.path.exists(path):
+            os.remove(path)
+    c.execute("DELETE FROM videos WHERE id=?", (vid,))
+    c.execute("DELETE FROM view_log WHERE video_id=?", (vid,))
+    conn.commit()
+    conn.close()
+    return jsonify(success=True)
+
+# ---------- Плейлисты ----------
+@app.route('/api/playlists', methods=['GET','POST'])
+def playlists():
+    if request.method == 'GET':
+        conn = sqlite3.connect(DB)
+        c = conn.cursor()
+        c.execute("SELECT id, name, created_at FROM playlists ORDER BY created_at DESC")
+        rows = c.fetchall()
+        conn.close()
+        return jsonify([{'id': r[0], 'name': r[1], 'created': r[2]} for r in rows])
+    else:
+        if not is_admin(): return jsonify(error='Forbidden'), 403
+        data = request.get_json()
+        name = data['name']
+        videos = json.dumps(data.get('videos', []))
+        conn = sqlite3.connect(DB)
+        c = conn.cursor()
+        c.execute("INSERT INTO playlists (name, videos) VALUES (?,?)", (name, videos))
+        conn.commit()
+        conn.close()
+        log_admin(f"Создан плейлист {name}")
+        return jsonify(success=True)
+
+@app.route('/api/playlists/<int:pid>', methods=['GET','PUT','DELETE'])
+def playlist(pid):
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    if request.method == 'GET':
+        c.execute("SELECT * FROM playlists WHERE id=?", (pid,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            return jsonify({'id': row[0], 'name': row[1], 'videos': json.loads(row[2]), 'created': row[3]})
+    elif request.method == 'PUT':
+        if not is_admin(): return jsonify(error='Forbidden'), 403
+        data = request.get_json()
+        c.execute("UPDATE playlists SET name=?, videos=? WHERE id=?",
+                  (data['name'], json.dumps(data['videos']), pid))
+        conn.commit()
+        conn.close()
+        log_admin(f"Обновлён плейлист {pid}")
+        return jsonify(success=True)
+    elif request.method == 'DELETE':
+        if not is_admin(): return jsonify(error='Forbidden'), 403
+        c.execute("DELETE FROM playlists WHERE id=?", (pid,))
+        conn.commit()
+        conn.close()
+        log_admin(f"Удалён плейлист {pid}")
+        return jsonify(success=True)
+    conn.close()
+    return jsonify(error='Not found'), 404
+
+# ---------- Генератор ссылок под плеер ----------
+@app.route('/api/generate-link/<int:vid>')
+def generate_link(vid):
+    player = request.args.get('player','usharp')
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("SELECT filename FROM videos WHERE id=?", (vid,))
+    row = c.fetchone()
+    conn.close()
+    if not row: return jsonify(error='Not found'), 404
+    base = f"https://foxhome-yip.ru/videos/{row[0]}"
+    if player in ('protv','yam','vizvid'):
+        return jsonify(url=json.dumps([{"url": base}]), type='json')
+    else:
+        return jsonify(url=base, type='direct')
+
+# ---------- Статус видео (для прогресс-бара) ----------
+@app.route('/api/video-status/<int:vid>')
+def video_status(vid):
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("SELECT status, progress FROM videos WHERE id=?", (vid,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return jsonify({'status': row[0], 'progress': row[1]})
+    return jsonify(error='Not found'), 404
+
+# ---------- Настройки ----------
+@app.route('/api/settings', methods=['GET','POST'])
+def settings():
+    conn = sqlite3.connect(DB)
+    if request.method == 'GET':
+        c = conn.cursor()
+        c.execute("SELECT key, value FROM settings")
+        rows = c.fetchall()
+        conn.close()
+        return jsonify({k:v for k,v in rows})
+    else:
+        if not is_admin(): return jsonify(error='Forbidden'), 403
+        data = request.get_json()
+        c = conn.cursor()
+        for k,v in data.items():
+            c.execute("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)", (k,v))
+        conn.commit()
+        conn.close()
+        log_admin("Сохранены настройки")
+        return jsonify(success=True)
+
+# ---------- Статика ----------
+@app.route('/')
+def index():
+    return send_from_directory(f'{BASE}/web', 'index.html')
+
+@app.route('/<path:filename>')
+def static_files(filename):
+    return send_from_directory(f'{BASE}/web', filename)
+
+@app.route('/static/thumbnails/<path:filename>')
+def thumb(filename):
+    return send_from_directory(THUMB, filename)
+
+if __name__ == '__main__':
+    init_db()
+    app.run(host='127.0.0.1', port=5000)
+APPEOF
+
+# Восстанавливаем пароль (если был установлен ранее)
+if [ -n "$OLD_PASS" ]; then
+    sed -i "s/ADMIN_PASS = \"__PASSWORD__\"/ADMIN_PASS = \"$OLD_PASS\"/" "$INSTALL_DIR/app.py"
+else
+    sed -i "s/ADMIN_PASS = \"__PASSWORD__\"/ADMIN_PASS = \"admin\"/" "$INSTALL_DIR/app.py"
+fi
+
+echo "Перезапускаю сервис..."
+systemctl restart mediacore
+
+echo "Готово! Авторизация и плейлисты должны работать."
